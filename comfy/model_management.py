@@ -29,6 +29,7 @@ total_vram = 0
 lowvram_available = True
 xpu_available = False
 
+
 if args.deterministic:
     logging.info("Using deterministic algorithms for pytorch")
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -43,6 +44,15 @@ if args.directml is not None:
     else:
         directml_device = torch_directml.device(device_index)
     logging.info("Using directml with device: {}".format(torch_directml.device_name(device_index)))
+    # torch_directml.disable_tiled_resources(True)
+    lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
+
+openvino_enabled = False
+if args.openvino is not None:
+    import openvino.torch
+    openvino_enabled = True
+    openvino_device = args.openvino
+    logging.info("Using openvino with device: {}".format(openvino_device))
     # torch_directml.disable_tiled_resources(True)
     lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
 
@@ -73,6 +83,7 @@ def is_intel_xpu():
 
 def get_torch_device():
     global directml_enabled
+    global openvino_enabled
     global cpu_state
     if directml_enabled:
         global directml_device
@@ -81,6 +92,9 @@ def get_torch_device():
         return torch.device("mps")
     if cpu_state == CPUState.CPU:
         return torch.device("cpu")
+    if openvino_enabled:
+        global openvino_device
+        return openvino_device
     else:
         if is_intel_xpu():
             return torch.device("xpu", torch.xpu.current_device())
@@ -89,6 +103,8 @@ def get_torch_device():
 
 def get_total_memory(dev=None, torch_total_too=False):
     global directml_enabled
+    global openvino_enabled
+
     if dev is None:
         dev = get_torch_device()
 
@@ -104,6 +120,9 @@ def get_total_memory(dev=None, torch_total_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_total = torch.xpu.get_device_properties(dev).total_memory
             mem_total_torch = mem_reserved
+        elif openvino_enabled:
+            mem_total = 1024 * 1024 * 1024 #TODO
+            mem_total_torch = mem_total
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
@@ -305,6 +324,12 @@ class LoadedModel:
 
         if is_intel_xpu() and not args.disable_ipex_optimize:
             self.real_model = ipex.optimize(self.real_model.eval(), graph_mode=True, concat_linear=True)
+            
+        if openvino_enabled:
+            global openvino_device
+            self.real_model = torch.compile(self.real_model.eval(), backend="openvino",
+                                            options={
+                                                "device": openvino_device, "model_caching": True})
 
         self.weights_loaded = True
         return self.real_model
@@ -642,12 +667,16 @@ def cast_to_device(tensor, device, dtype, copy=False):
 
 def xformers_enabled():
     global directml_enabled
+    global openvino_enabled
+
     global cpu_state
     if cpu_state != CPUState.GPU:
         return False
     if is_intel_xpu():
         return False
     if directml_enabled:
+        return False
+    if openvino_enabled:
         return False
     return XFORMERS_IS_AVAILABLE
 
@@ -673,6 +702,7 @@ def pytorch_attention_flash_attention():
 
 def get_free_memory(dev=None, torch_free_too=False):
     global directml_enabled
+    global openvino_enabled
     if dev is None:
         dev = get_torch_device()
 
@@ -690,6 +720,9 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_torch = mem_reserved - mem_active
             mem_free_total = torch.xpu.get_device_properties(dev).total_memory - mem_allocated
+        elif openvino_enabled:
+            mem_free_total = 1024 * 1024 * 1024 #TODO
+            mem_free_torch = mem_free_total
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
@@ -728,6 +761,7 @@ def is_device_cuda(device):
 
 def should_use_fp16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
     global directml_enabled
+    global openvino_enabled
 
     if device is not None:
         if is_device_cpu(device):
@@ -744,6 +778,9 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
         return False
 
     if directml_enabled:
+        return False
+    
+    if openvino_enabled:
         return False
 
     if mps_mode():
@@ -803,6 +840,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
         return False
 
     if directml_enabled:
+        return False
+
+    if openvino_enabled:
         return False
 
     if cpu_mode() or mps_mode():
